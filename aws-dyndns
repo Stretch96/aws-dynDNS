@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# exit on failures
+set -e
+set -o pipefail
+
+usage() {
+  echo "Usage: $(basename "$0") [OPTIONS]" 1>&2
+  echo "  -h                   - help"
+  echo "  -z <zone_domain>     - AWS Zone domain name"
+  echo "  -r <record_value>    - Record value eg. home"
+  echo "  -c                   - create record if it doesn't exist"
+  echo "  -p <aws_profile>     - AWS Profile (defaults to default)"
+  exit 1
+}
+
+# if there are no arguments passed exit with usage
+if [ $# -lt 1 ];
+then
+ usage
+fi
+
+CREATE=0
+RECORD_ACTION="UPSERT"
+
+while getopts "cz:r:p:h" opt; do
+  case $opt in
+    c)
+      CREATE=1
+      ;;
+    z)
+      ZONE_NAME=$OPTARG
+      ;;
+    r)
+      RECORD_VALUE=$OPTARG
+      ;;
+    p)
+      AWS_PROFILE=$OPTARG
+      ;;
+    h)
+      usage
+      exit;;
+    *)
+      usage
+      exit;;
+  esac
+done
+
+if [[
+  -z "$ZONE_NAME" ||
+  -z "$RECORD_VALUE" 
+]]
+then
+  usage
+fi
+
+IP_CACHE_FILE="/tmp/dyn-dns-ip-cache-$RECORD_VALUE.$ZONE_NAME"
+
+AWS_PROFILE=${AWS_PROFILE:-default}
+export AWS_PROFILE
+
+PUBLIC_IP=$(curl -s ipinfo.io/ip)
+if [ "$PUBLIC_IP" == "" ]
+then
+  echo "Error: Could not reach ipinfo.io/ip"
+  exit 1
+fi
+
+if [ -f "$IP_CACHE_FILE" ]
+then
+  CACHED_PUBLIC_IP=$(cat "$IP_CACHE_FILE")
+fi
+
+if [ "$CACHED_PUBLIC_IP" == "$PUBLIC_IP" ]
+then
+  exit 0
+fi
+
+HOSTED_ZONES=$(aws route53 list-hosted-zones)
+
+ZONE=$(echo "$HOSTED_ZONES" | \
+  jq -r --arg zone_name "$ZONE_NAME." \
+  '.HostedZones[] | select(.Name == $zone_name)'
+)
+
+if [ "$ZONE" == "" ]
+then
+  echo "Error: $ZONE_NAME zone doesn't exist"
+  echo "       Create the Hosted Zone in AWS first"
+  exit 1
+fi
+
+HOSTED_ZONE_ID=$(echo "$ZONE" | jq -r '.Id')
+RECORD=$(aws route53 list-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" | \
+  jq -r --arg record_name "$RECORD_VALUE.$ZONE_NAME." \
+  '.ResourceRecordSets[] | select(.Name == $record_name) | select(.Type == "A")'
+)
+
+if [ "$RECORD" == "" ]
+then
+  if [ "$CREATE" == "1" ]
+  then
+    echo "Creating record"
+    RECORD_ACTION="CREATE"
+  else
+    echo "Error: $RECORD_VALUE record doesn't exist in $ZONE_NAME zone"
+    echo "       Either create the record first in AWS,"
+    echo "       or add the -c flag to create it"
+    exit 1
+  fi
+fi
+
+CHANGE_BATCH=$(
+  jq -n \
+  --arg action "$RECORD_ACTION" \
+  --arg record_name "$RECORD_VALUE.$ZONE_NAME" \
+  --arg record_type "A" \
+  --argjson record_ttl 60 \
+  --arg record_value "$PUBLIC_IP" \
+  '{
+    Changes: [
+      {
+        Action: $action,
+        ResourceRecordSet: {
+          Name: $record_name,
+          Type: $record_type,
+          TTL: $record_ttl,
+          ResourceRecords: [
+            {
+              Value: $record_value
+            }
+          ]
+        }
+      }
+    ]
+  }
+  '
+)
+
+CHANGE_RESULT=$(aws route53 change-resource-record-sets \
+  --hosted-zone-id "$HOSTED_ZONE_ID" \
+  --change-batch "$CHANGE_BATCH"
+)
+
+CHANGE_STATUS=$(echo "$CHANGE_RESULT" | jq -r '.ChangeInfo.Status')
+
+echo "Record $RECORD_VALUE.$ZONE_NAME updated to $PUBLIC_IP - Status: $CHANGE_STATUS"
+
+echo "$PUBLIC_IP" > "$IP_CACHE_FILE"
+
