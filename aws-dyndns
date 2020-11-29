@@ -9,6 +9,13 @@ usage() {
   echo "  -h                   - help"
   echo "  -z <zone_domain>     - AWS Zone domain name"
   echo "  -r <record_value>    - Record value eg. home"
+  echo "  -R                   - Set as Root record"
+  echo "                           This option sets the A rceord"
+  echo "                           of the Zone domain name to the"
+  echo "                           Public ip obtained"
+  echo "                             do not use -r with this"
+  echo "                             parameter, -R will be ignored"
+  echo "                             and may cause unintended results"
   echo "  -c                   - create record if it doesn't exist"
   echo "  -p <aws_profile>     - AWS Profile (defaults to default)"
   exit 1
@@ -21,12 +28,16 @@ then
 fi
 
 CREATE=0
+ROOT_RECORD=0
 RECORD_ACTION="UPSERT"
 
-while getopts "cz:r:p:h" opt; do
+while getopts "cz:Rr:p:h" opt; do
   case $opt in
     c)
       CREATE=1
+      ;;
+    R)
+      ROOT_RECORD=1
       ;;
     z)
       ZONE_NAME=$OPTARG
@@ -51,7 +62,10 @@ if [[
   -z "$RECORD_VALUE" 
 ]]
 then
-  usage
+  if [ "$ROOT_RECORD" == "0" ]
+  then
+    usage
+  fi
 fi
 
 IP_CACHE_FILE="/tmp/dyn-dns-ip-cache-$RECORD_VALUE.$ZONE_NAME"
@@ -136,6 +150,8 @@ CHANGE_BATCH=$(
   }
   '
 )
+
+echo "$CHANGE_BATCH"
 
 CHANGE_RESULT=$(aws route53 change-resource-record-sets \
   --hosted-zone-id "$HOSTED_ZONE_ID" \
